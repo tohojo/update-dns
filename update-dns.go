@@ -41,6 +41,9 @@ func readConfig() string {
 	flag.StringP("server", "s", "", "Server name")
 	viper.BindPFlag("server", flag.Lookup("server"))
 
+	flag.StringP("zone", "z", "", "Zone to update (will be auto-detected if absent)")
+	viper.BindPFlag("zone", flag.Lookup("zone"))
+
 	viper.SetDefault("debug", false)
 
 	viper.SetConfigName("update-dns")
@@ -72,7 +75,7 @@ func readConfig() string {
 
 func getZone(name string) string {
 	if len(viper.GetString("zone")) > 0 {
-		return viper.GetString("zone")
+		return dns.Fqdn(viper.GetString("zone"))
 	}
 
 	c := new(dns.Client)
