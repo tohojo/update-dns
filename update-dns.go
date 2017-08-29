@@ -88,6 +88,12 @@ func getZone(name string) string {
 		log.Panicf("Unable to discover zone: %s", err)
 	}
 
+	for _, k := range r.Answer {
+		if soa, ok := k.(*dns.SOA); ok {
+			return soa.Hdr.Name
+		}
+	}
+
 	for _, k := range r.Ns {
 		if soa, ok := k.(*dns.SOA); ok {
 			return soa.Hdr.Name
