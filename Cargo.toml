@@ -1,0 +1,13 @@
+[package]
+name = "update-dns"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.53", features = ["derive"] }
+dns-update = "0.1.6"
+hickory-resolver = "0.25.2"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = "1.48.0"
+tracing = "0.1.44"
