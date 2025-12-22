@@ -1,7 +1,9 @@
+use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::dnssec::rdata::tsig::TsigAlgorithm;
-use hickory_proto::rr::{DNSClass, Name, RecordType};
+use hickory_proto::dnssec::tsig::TSigner;
+use hickory_proto::rr::{DNSClass, Name, Record, RecordType, rdata, record_data::RData};
 use hickory_proto::runtime::TokioRuntimeProvider;
 use hickory_proto::tcp::TcpClientStream;
 use proc_exit::Code;
@@ -9,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::{base64::Base64, serde_as};
 use std::{
     fs::File,
-    net::{SocketAddr, ToSocketAddrs},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    sync::Arc,
     time::Duration,
 };
 use tracing::{debug, error, info};
@@ -67,6 +70,39 @@ struct Args {
     ttl: u32,
 }
 
+impl Args {
+    fn to_record(&self) -> Result<Record> {
+        use DnsRecordType::*;
+        let Some(value) = &self.value else {
+            bail!("No value");
+        };
+
+        let rdata: RData = match self.record_type {
+            Some(A) => match value.parse::<Ipv4Addr>() {
+                Ok(ip) => RData::A(rdata::A(ip)),
+                Err(error) => bail!("Unable to parse {} as an IPv4 address: {}", value, error),
+            },
+            Some(AAAA) => match value.parse::<Ipv6Addr>() {
+                Ok(ip) => RData::AAAA(rdata::AAAA(ip)),
+                Err(error) => bail!("Unable to parse {} as an IP address: {}", value, error),
+            },
+            _ => bail!("No record type"),
+        };
+        Ok(Record::from_rdata(self.hostname.clone(), self.ttl, rdata))
+    }
+
+    fn to_update0(&self) -> Result<Record> {
+        let Some(rtype) = &self.record_type else {
+            bail!("No record type");
+        };
+        Ok(Record::update0(
+            self.hostname.clone(),
+            self.ttl,
+            rtype.clone().into(),
+        ))
+    }
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Config {
     server: String,
@@ -76,10 +112,84 @@ struct Config {
 #[serde_as]
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct TsigKey {
-    name: String,
+    name: Name,
     algorithm: TsigAlgorithm,
     #[serde_as(as = "Base64")]
     data: Vec<u8>,
+}
+
+async fn delete_name(args: &Args, zone: &Name, client: &mut Client) -> anyhow::Result<()> {
+    let response = match args.to_update0() {
+        Ok(record) => {
+            info!(
+                "Deleting type {} for name {}",
+                record.record_type(),
+                args.hostname
+            );
+            client.delete_rrset(record, zone.clone()).await?
+        }
+        Err(_) => {
+            info!("Deleting all RRSETs for name {}", args.hostname);
+            client
+                .delete_all(args.hostname.clone(), zone.clone(), DNSClass::IN)
+                .await?
+        }
+    };
+    match response.response_code() {
+        hickory_proto::op::ResponseCode::NoError => Ok(()),
+        other => {
+            bail!("Server returned error: {}", other);
+        }
+    }
+}
+
+async fn update_name(
+    args: &Args,
+    zone: &Name,
+    name_exists: bool,
+    client: &mut Client,
+) -> anyhow::Result<()> {
+    let record = args.to_record()?;
+    let response = match name_exists {
+        true => {
+            info!("Appending record {}", record);
+            client.append(record, zone.clone(), true).await?
+        }
+        false => {
+            info!("Creating record {}", record);
+            client.create(record, zone.clone()).await?
+        }
+    };
+    debug!(response = ?response, "Received response");
+    match response.response_code() {
+        hickory_proto::op::ResponseCode::NoError => Ok(()),
+        other => {
+            bail!("Server returned error: {}", other);
+        }
+    }
+}
+
+async fn create_client(server: SocketAddr, tsig_key: TsigKey) -> anyhow::Result<Client> {
+    let (stream, sender) = TcpClientStream::new(
+        server,
+        None,
+        Some(Duration::from_secs(1)),
+        TokioRuntimeProvider::new(),
+    );
+
+    let (client, bg) = Client::new(
+        stream,
+        sender,
+        Some(Arc::new(TSigner::new(
+            tsig_key.data,
+            tsig_key.algorithm,
+            tsig_key.name,
+            60,
+        )?)),
+    )
+    .await?;
+    tokio::spawn(bg);
+    Ok(client)
 }
 
 /// Attempt to find the zone root by querying the configured name server for the
@@ -88,30 +198,12 @@ struct TsigKey {
 async fn find_zone_root(
     hostname: &Name,
     new_type: Option<DnsRecordType>,
-    server: SocketAddr,
+    client: &mut Client,
 ) -> Option<(Name, bool)> {
-    debug!("Finding zone root for {} on {}", hostname, server);
+    debug!("Finding zone root for {}", hostname);
 
     let mut name_exists = false;
 
-    let (stream, sender) = TcpClientStream::new(
-        server,
-        None,
-        Some(Duration::from_secs(1)),
-        TokioRuntimeProvider::new(),
-    );
-
-    let client = Client::new(stream, sender, None);
-
-    let (mut client, bg) = match client.await {
-        Ok(res) => res,
-        Err(error) => {
-            error!("Unable to connect to DNS server: {}", error);
-            return None;
-        }
-    };
-
-    tokio::spawn(bg);
     let query = client.query(hostname.clone(), DNSClass::IN, RecordType::ANY);
     let ns_query = client.query(hostname.clone(), DNSClass::IN, RecordType::NS);
 
@@ -210,7 +302,7 @@ async fn main() -> proc_exit::Exit {
     debug!(args = ?args,
            server = config.server,
            server_addr = ?server_addr,
-           key.name = config.key.name,
+           key.name = %config.key.name,
            key.algorithm = %config.key.algorithm,
            "Init OK");
 
@@ -218,16 +310,36 @@ async fn main() -> proc_exit::Exit {
         error!("Must supply both record type and value when not deleting");
         return Code::FAILURE.as_exit();
     }
-    let Some((_root_zone, name_exists)) =
-        find_zone_root(&args.hostname, args.record_type, server_addr).await
+
+    let Ok(mut client) = create_client(server_addr, config.key).await else {
+        return Code::FAILURE.as_exit();
+    };
+
+    let Some((root_zone, name_exists)) =
+        find_zone_root(&args.hostname, args.record_type, &mut client).await
     else {
         return Code::FAILURE.as_exit();
     };
 
-    if !name_exists && args.delete {
-        error!("Can't delete name {} that doesn't exist", args.hostname);
-        return Code::FAILURE.as_exit();
+    if args.delete {
+        if !name_exists {
+            error!("Can't delete name {} that doesn't exist", args.hostname);
+            return Code::FAILURE.as_exit();
+        }
+        match delete_name(&args, &root_zone, &mut client).await {
+            Ok(_) => Code::SUCCESS.as_exit(),
+            Err(error) => {
+                error!("Error deleting name: {}", error);
+                Code::FAILURE.as_exit()
+            }
+        }
+    } else {
+        match update_name(&args, &root_zone, name_exists, &mut client).await {
+            Ok(_) => Code::SUCCESS.as_exit(),
+            Err(error) => {
+                error!("Error updating name: {}", error);
+                Code::FAILURE.as_exit()
+            }
+        }
     }
-
-    Code::SUCCESS.as_exit()
 }
