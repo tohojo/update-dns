@@ -157,14 +157,11 @@ impl Args {
         Ok(Record::from_rdata(self.hostname.clone(), self.ttl, rdata))
     }
 
-    fn to_update0(&self) -> Result<Record> {
-        Ok(Record::update0(
+    fn to_update0(&self) -> Option<Record> {
+        Some(Record::update0(
             self.hostname.clone(),
             self.ttl,
-            self.record_type
-                .ok_or(format_err!("Missing record type"))?
-                .clone()
-                .into(),
+            self.record_type?.clone().into(),
         ))
     }
 }
@@ -185,28 +182,25 @@ struct TsigKey {
 }
 
 async fn delete_name(args: &Args, zone: &Name, client: &mut Client) -> anyhow::Result<()> {
-    let response = match args.to_update0() {
-        Ok(record) => {
-            info!(
-                "Deleting type {} for name {}",
-                record.record_type(),
-                args.hostname
-            );
-            client.delete_rrset(record, zone.clone()).await?
-        }
-        Err(_) => {
-            info!("Deleting all RRSETs for name {}", args.hostname);
-            client
-                .delete_all(args.hostname.clone(), zone.clone(), DNSClass::IN)
-                .await?
-        }
+    let response = if let Some(record) = args.to_update0() {
+        info!(
+            "Deleting record type {} for name {}",
+            record.record_type(),
+            args.hostname
+        );
+        client.delete_rrset(record, zone.clone()).await?
+    } else {
+        info!("Deleting all RRSETs for name {}", args.hostname);
+        client
+            .delete_all(args.hostname.clone(), zone.clone(), DNSClass::IN)
+            .await?
     };
-    match response.response_code() {
-        ResponseCode::NoError => Ok(()),
-        other => {
-            bail!("Server returned error: {}", other);
-        }
+
+    debug!(response = ?response, "Received response for delete");
+    if response.response_code() != ResponseCode::NoError {
+        bail!("Server returned error: {}", response.response_code());
     }
+    Ok(())
 }
 
 async fn update_name(
@@ -221,18 +215,23 @@ async fn update_name(
         if args.append {
             info!("Appending record {}", record);
             let response = client.append(record, zone.clone(), true).await?;
+
+            debug!(response = ?response, "Received response for append");
             if response.response_code() != ResponseCode::NoError {
                 bail!("Server returned error: {}", response.response_code());
             }
+
             return Ok(());
         } else {
-            let update0 = args.to_update0()?;
+            let update0 = args.to_update0().unwrap();
             info!(
                 "Deleting type {} for name {}",
                 update0.record_type(),
                 args.hostname
             );
             let response = client.delete_rrset(update0, zone.clone()).await?;
+
+            debug!(response = ?response, "Received response for delete");
             if response.response_code() != ResponseCode::NoError {
                 bail!("Server returned error: {}", response.response_code());
             }
@@ -241,13 +240,16 @@ async fn update_name(
 
     info!("Creating record {}", record);
     let response = client.create(record, zone.clone()).await?;
-    debug!(response = ?response, "Received response");
+
+    debug!(response = ?response, "Received response for create");
     if response.response_code() != ResponseCode::NoError {
         bail!("Server returned error: {}", response.response_code());
     }
     Ok(())
 }
 
+/// Create a new hickory_client client object with an attached TSig signer,
+/// and spawn the background task to handle communication
 async fn create_client(server: SocketAddr, tsig_key: TsigKey) -> anyhow::Result<Client> {
     let (stream, sender) = TcpClientStream::new(
         server,
@@ -278,44 +280,34 @@ async fn find_zone_root(
     hostname: &Name,
     new_type: Option<DnsRecordType>,
     client: &mut Client,
-) -> Option<(Name, bool)> {
+) -> Result<(Name, bool)> {
     debug!("Finding zone root for {}", hostname);
 
     let mut name_exists = false;
 
-    let query = client.query(hostname.clone(), DNSClass::IN, RecordType::ANY);
-    let ns_query = client.query(hostname.clone(), DNSClass::IN, RecordType::NS);
-
-    let response = match query.await {
-        Ok(res) => res,
-        Err(error) => {
-            error!("Unable to query server for name {}: {}", hostname, error);
-            return None;
-        }
-    };
-
-    let ns_response = match ns_query.await {
-        Ok(res) => res,
-        Err(error) => {
-            error!("Unable to query server for name {}: {}", hostname, error);
-            return None;
-        }
-    };
+    let response = client
+        .query(hostname.clone(), DNSClass::IN, RecordType::ANY)
+        .await?;
+    let ns_response = client
+        .query(hostname.clone(), DNSClass::IN, RecordType::NS)
+        .await?;
 
     debug!(response = ?response, ns_response= ?ns_response, "Queried server for {}", hostname);
 
     match response.response_code() {
         ResponseCode::NXDomain => (),
         ResponseCode::NoError => (),
-        other => {
-            error!("Server returned error: {}", other);
-            return None;
-        }
+        other => bail!("Server returned error: {}", other),
+    };
+
+    match ns_response.response_code() {
+        ResponseCode::NXDomain => (),
+        ResponseCode::NoError => (),
+        other => bail!("Server returned error: {}", other),
     };
 
     if !response.authoritative() {
-        error!("Server is not authoritative for hostname {}", hostname);
-        return None;
+        bail!("Server is not authoritative for hostname {}", hostname);
     }
 
     for resp in response.answers() {
@@ -335,13 +327,10 @@ async fn find_zone_root(
     }
 
     match ns_response.name_servers() {
-        [] => {
-            error!("Server returned no name servers");
-            None
-        }
+        [] => Err(format_err!("Server returned no name servers")),
         [first, ..] => {
             debug!("Found name server: {:?}", first);
-            Some((first.name().clone(), name_exists))
+            Ok((first.name().clone(), name_exists))
         }
     }
 }
@@ -390,15 +379,22 @@ async fn main() -> proc_exit::Exit {
         return Code::FAILURE.as_exit();
     }
 
-    let Ok(mut client) = create_client(server_addr, config.key).await else {
-        return Code::FAILURE.as_exit();
+    let mut client = match create_client(server_addr, config.key).await {
+        Ok(client) => client,
+        Err(error) => {
+            error!("Error creating DNS client: {}", error);
+            return Code::FAILURE.as_exit();
+        }
     };
 
-    let Some((root_zone, name_exists)) =
-        find_zone_root(&args.hostname, args.record_type, &mut client).await
-    else {
-        return Code::FAILURE.as_exit();
-    };
+    let (root_zone, name_exists) =
+        match find_zone_root(&args.hostname, args.record_type, &mut client).await {
+            Ok(ret) => ret,
+            Err(error) => {
+                error!("Error finding root zone: {}", error);
+                return Code::FAILURE.as_exit();
+            }
+        };
 
     if args.delete {
         if !name_exists {
