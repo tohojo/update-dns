@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, format_err};
 use clap::{Parser, ValueEnum};
 use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::dnssec::rdata::tsig::TsigAlgorithm;
@@ -25,10 +25,11 @@ enum DnsRecordType {
     A,
     AAAA,
     CNAME,
-    NS,
     MX,
-    TXT,
+    NS,
+    PTR,
     SRV,
+    TXT,
 }
 
 impl Into<RecordType> for DnsRecordType {
@@ -38,10 +39,11 @@ impl Into<RecordType> for DnsRecordType {
             A => RecordType::A,
             AAAA => RecordType::AAAA,
             CNAME => RecordType::CNAME,
-            NS => RecordType::NS,
             MX => RecordType::MX,
-            TXT => RecordType::TXT,
+            NS => RecordType::NS,
+            PTR => RecordType::PTR,
             SRV => RecordType::SRV,
+            TXT => RecordType::TXT,
         }
     }
 }
@@ -57,7 +59,7 @@ struct Args {
     record_type: Option<DnsRecordType>,
 
     /// DNS record value
-    value: Option<String>,
+    value: Vec<String>,
     /// Also insert reverse PTR entry
     #[arg(short, long)]
     reverse: bool,
@@ -78,28 +80,91 @@ struct Args {
 impl Args {
     fn to_record(&self) -> Result<Record> {
         use DnsRecordType::*;
-        let Some(value) = &self.value else {
-            bail!("No value");
-        };
-
         let rdata: RData = match self.record_type {
-            Some(A) => RData::A(rdata::A(value.parse::<Ipv4Addr>()?)),
-            Some(AAAA) => RData::AAAA(rdata::AAAA(value.parse::<Ipv6Addr>()?)),
-            Some(CNAME) => RData::CNAME(rdata::CNAME(Name::from_str_relaxed(value)?)),
-            Some(TXT) => RData::TXT(rdata::TXT::new(vec![value.clone()])),
-            _ => bail!("No record type"),
+            Some(A) => RData::A(rdata::A(
+                self.value
+                    .first()
+                    .ok_or(format_err!("No value"))?
+                    .parse::<Ipv4Addr>()?,
+            )),
+            Some(AAAA) => RData::AAAA(rdata::AAAA(
+                self.value
+                    .first()
+                    .ok_or(format_err!("No value"))?
+                    .parse::<Ipv6Addr>()?,
+            )),
+            Some(CNAME) => RData::CNAME(rdata::CNAME(
+                self.value
+                    .first()
+                    .ok_or(format_err!("No value"))?
+                    .parse::<Name>()?,
+            )),
+            Some(MX) => RData::MX(rdata::MX::new(
+                self.value
+                    .get(0)
+                    .ok_or(format_err!("No value"))?
+                    .parse::<u16>()
+                    .with_context(|| {
+                        format!("Invalid MX priority '{}'", self.value.get(0).unwrap())
+                    })?,
+                self.value
+                    .get(1)
+                    .ok_or(format_err!("Missing MX target"))?
+                    .parse::<Name>()?,
+            )),
+            Some(NS) => RData::NS(rdata::NS(
+                self.value
+                    .first()
+                    .ok_or(format_err!("No value"))?
+                    .parse::<Name>()?,
+            )),
+            Some(PTR) => RData::PTR(rdata::PTR(
+                self.value
+                    .first()
+                    .ok_or(format_err!("No value"))?
+                    .parse::<Name>()?,
+            )),
+            Some(SRV) => RData::SRV(rdata::SRV::new(
+                self.value
+                    .get(0)
+                    .ok_or(format_err!("No value"))?
+                    .parse::<u16>()
+                    .with_context(|| {
+                        format!("Invalid SRV priority '{}'", self.value.get(0).unwrap())
+                    })?,
+                self.value
+                    .get(1)
+                    .ok_or(format_err!("Missing SRV weight"))?
+                    .parse::<u16>()
+                    .with_context(|| {
+                        format!("Invalid SRV weight '{}'", self.value.get(1).unwrap())
+                    })?,
+                self.value
+                    .get(2)
+                    .ok_or(format_err!("Missing SRV port"))?
+                    .parse::<u16>()
+                    .with_context(|| {
+                        format!("Invalid SRV port '{}'", self.value.get(2).unwrap())
+                    })?,
+                self.value
+                    .get(3)
+                    .ok_or(format_err!("Missing SRV target"))?
+                    .parse::<Name>()?,
+            )),
+            Some(TXT) => RData::TXT(rdata::TXT::new(self.value.clone())),
+            None => bail!("No record type"),
         };
         Ok(Record::from_rdata(self.hostname.clone(), self.ttl, rdata))
     }
 
     fn to_update0(&self) -> Result<Record> {
-        let Some(rtype) = &self.record_type else {
-            bail!("No record type");
-        };
         Ok(Record::update0(
             self.hostname.clone(),
             self.ttl,
-            rtype.clone().into(),
+            self.record_type
+                .ok_or(format_err!("Missing record type"))?
+                .clone()
+                .into(),
         ))
     }
 }
@@ -320,7 +385,7 @@ async fn main() -> proc_exit::Exit {
            key.algorithm = %config.key.algorithm,
            "Init OK");
 
-    if !args.delete && (args.record_type.is_none() || args.value.is_none()) {
+    if !args.delete && (args.record_type.is_none() || args.value.len() == 0) {
         error!("Must supply both record type and value when not deleting");
         return Code::FAILURE.as_exit();
     }
