@@ -3,6 +3,7 @@ use clap::{Parser, ValueEnum};
 use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::dnssec::rdata::tsig::TsigAlgorithm;
 use hickory_proto::dnssec::tsig::TSigner;
+use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, Name, Record, RecordType, rdata, record_data::RData};
 use hickory_proto::runtime::TokioRuntimeProvider;
 use hickory_proto::tcp::TcpClientStream;
@@ -65,6 +66,10 @@ struct Args {
     #[arg(short, long)]
     delete: bool,
 
+    /// Append DNS entry instead of replacing
+    #[arg(short, long)]
+    append: bool,
+
     /// DNS TTL
     #[arg(short, long, value_name = "SECONDS", default_value_t = 86400)]
     ttl: u32,
@@ -78,14 +83,10 @@ impl Args {
         };
 
         let rdata: RData = match self.record_type {
-            Some(A) => match value.parse::<Ipv4Addr>() {
-                Ok(ip) => RData::A(rdata::A(ip)),
-                Err(error) => bail!("Unable to parse {} as an IPv4 address: {}", value, error),
-            },
-            Some(AAAA) => match value.parse::<Ipv6Addr>() {
-                Ok(ip) => RData::AAAA(rdata::AAAA(ip)),
-                Err(error) => bail!("Unable to parse {} as an IP address: {}", value, error),
-            },
+            Some(A) => RData::A(rdata::A(value.parse::<Ipv4Addr>()?)),
+            Some(AAAA) => RData::AAAA(rdata::AAAA(value.parse::<Ipv6Addr>()?)),
+            Some(CNAME) => RData::CNAME(rdata::CNAME(Name::from_str_relaxed(value)?)),
+            Some(TXT) => RData::TXT(rdata::TXT::new(vec![value.clone()])),
             _ => bail!("No record type"),
         };
         Ok(Record::from_rdata(self.hostname.clone(), self.ttl, rdata))
@@ -136,7 +137,7 @@ async fn delete_name(args: &Args, zone: &Name, client: &mut Client) -> anyhow::R
         }
     };
     match response.response_code() {
-        hickory_proto::op::ResponseCode::NoError => Ok(()),
+        ResponseCode::NoError => Ok(()),
         other => {
             bail!("Server returned error: {}", other);
         }
@@ -150,23 +151,36 @@ async fn update_name(
     client: &mut Client,
 ) -> anyhow::Result<()> {
     let record = args.to_record()?;
-    let response = match name_exists {
-        true => {
+
+    if name_exists {
+        if args.append {
             info!("Appending record {}", record);
-            client.append(record, zone.clone(), true).await?
-        }
-        false => {
-            info!("Creating record {}", record);
-            client.create(record, zone.clone()).await?
-        }
-    };
-    debug!(response = ?response, "Received response");
-    match response.response_code() {
-        hickory_proto::op::ResponseCode::NoError => Ok(()),
-        other => {
-            bail!("Server returned error: {}", other);
+            let response = client.append(record, zone.clone(), true).await?;
+            if response.response_code() != ResponseCode::NoError {
+                bail!("Server returned error: {}", response.response_code());
+            }
+            return Ok(());
+        } else {
+            let update0 = args.to_update0()?;
+            info!(
+                "Deleting type {} for name {}",
+                update0.record_type(),
+                args.hostname
+            );
+            let response = client.delete_rrset(update0, zone.clone()).await?;
+            if response.response_code() != ResponseCode::NoError {
+                bail!("Server returned error: {}", response.response_code());
+            }
         }
     }
+
+    info!("Creating record {}", record);
+    let response = client.create(record, zone.clone()).await?;
+    debug!(response = ?response, "Received response");
+    if response.response_code() != ResponseCode::NoError {
+        bail!("Server returned error: {}", response.response_code());
+    }
+    Ok(())
 }
 
 async fn create_client(server: SocketAddr, tsig_key: TsigKey) -> anyhow::Result<Client> {
@@ -226,8 +240,8 @@ async fn find_zone_root(
     debug!(response = ?response, ns_response= ?ns_response, "Queried server for {}", hostname);
 
     match response.response_code() {
-        hickory_proto::op::ResponseCode::NXDomain => (),
-        hickory_proto::op::ResponseCode::NoError => (),
+        ResponseCode::NXDomain => (),
+        ResponseCode::NoError => (),
         other => {
             error!("Server returned error: {}", other);
             return None;
