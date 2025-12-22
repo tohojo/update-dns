@@ -78,6 +78,8 @@ struct Args {
 }
 
 impl Args {
+    /// Create a DNS Record type from the arguments supplied on the command
+    /// line, parsing the values into the right types for the given record type
     fn to_record(&self) -> Result<Record> {
         use DnsRecordType::*;
         let rdata: RData = match self.record_type {
@@ -157,6 +159,8 @@ impl Args {
         Ok(Record::from_rdata(self.hostname.clone(), self.ttl, rdata))
     }
 
+    /// Create an Update0 Record from the hostname and record type specified by
+    /// the args
     fn to_update0(&self) -> Option<Record> {
         Some(Record::update0(
             self.hostname.clone(),
@@ -181,6 +185,10 @@ struct TsigKey {
     data: Vec<u8>,
 }
 
+/// Delete a name from DNS.
+///
+/// If a record type is set, delete only that type, otherwise delete all records
+/// for the name given in args.
 async fn delete_name(args: &Args, zone: &Name, client: &mut Client) -> anyhow::Result<()> {
     let response = if let Some(record) = args.to_update0() {
         info!(
@@ -203,6 +211,11 @@ async fn delete_name(args: &Args, zone: &Name, client: &mut Client) -> anyhow::R
     Ok(())
 }
 
+/// Update a name in DNS.
+///
+/// If the append flag is specified in args, add the record to the existing
+/// RRset. Otherwise, issue a delete for the given record type first,
+/// effectively replacing the record. If no record exists, create a new one.
 async fn update_name(
     args: &Args,
     zone: &Name,
@@ -248,8 +261,10 @@ async fn update_name(
     Ok(())
 }
 
-/// Create a new hickory_client client object with an attached TSig signer,
-/// and spawn the background task to handle communication
+/// Create a new hickory_client client object.
+///
+/// Attach a TSig signer object, and spawn the background task to handle
+/// communication
 async fn create_client(server: SocketAddr, tsig_key: TsigKey) -> anyhow::Result<Client> {
     let (stream, sender) = TcpClientStream::new(
         server,
@@ -273,9 +288,11 @@ async fn create_client(server: SocketAddr, tsig_key: TsigKey) -> anyhow::Result<
     Ok(client)
 }
 
-/// Attempt to find the zone root by querying the configured name server for the
-/// hostname, and returning the zone name returned in the name servers in the
-/// response
+/// Attempt to find the zone root
+///
+/// Query the configured name server for the hostname and NS servers, and return
+/// the zone name returned in the NS response along with a boolean indicating
+/// whether a record of the given new_type exists in DNS.
 async fn find_zone_root(
     hostname: &Name,
     new_type: Option<DnsRecordType>,
