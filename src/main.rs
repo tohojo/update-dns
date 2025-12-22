@@ -10,10 +10,9 @@ use serde_with::{base64::Base64, serde_as};
 use std::{
     fs::File,
     net::{SocketAddr, ToSocketAddrs},
-    str::FromStr,
     time::Duration,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 /// A DNS record type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -28,18 +27,33 @@ enum DnsRecordType {
     SRV,
 }
 
+impl Into<RecordType> for DnsRecordType {
+    fn into(self) -> RecordType {
+        use DnsRecordType::*;
+        match self {
+            A => RecordType::A,
+            AAAA => RecordType::AAAA,
+            CNAME => RecordType::CNAME,
+            NS => RecordType::NS,
+            MX => RecordType::MX,
+            TXT => RecordType::TXT,
+            SRV => RecordType::SRV,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// DNS hostname to update
-    hostname: String,
+    hostname: Name,
 
     /// DNS record type
     #[arg(value_enum)]
-    record_type: DnsRecordType,
+    record_type: Option<DnsRecordType>,
 
     /// DNS record value
-    value: String,
+    value: Option<String>,
     /// Also insert reverse PTR entry
     #[arg(short, long)]
     reverse: bool,
@@ -71,9 +85,14 @@ struct TsigKey {
 /// Attempt to find the zone root by querying the configured name server for the
 /// hostname, and returning the zone name returned in the name servers in the
 /// response
-#[tracing::instrument]
-async fn find_zone_root(hostname: &str, server: SocketAddr) -> Option<(Name, bool)> {
+async fn find_zone_root(
+    hostname: &Name,
+    new_type: Option<DnsRecordType>,
+    server: SocketAddr,
+) -> Option<(Name, bool)> {
     debug!("Finding zone root for {} on {}", hostname, server);
+
+    let mut name_exists = false;
 
     let (stream, sender) = TcpClientStream::new(
         server,
@@ -93,11 +112,8 @@ async fn find_zone_root(hostname: &str, server: SocketAddr) -> Option<(Name, boo
     };
 
     tokio::spawn(bg);
-    let query = client.query(
-        Name::from_str(hostname).unwrap(),
-        DNSClass::IN,
-        RecordType::NS,
-    );
+    let query = client.query(hostname.clone(), DNSClass::IN, RecordType::ANY);
+    let ns_query = client.query(hostname.clone(), DNSClass::IN, RecordType::NS);
 
     let response = match query.await {
         Ok(res) => res,
@@ -107,11 +123,19 @@ async fn find_zone_root(hostname: &str, server: SocketAddr) -> Option<(Name, boo
         }
     };
 
-    debug!("Response: {:?}", response);
+    let ns_response = match ns_query.await {
+        Ok(res) => res,
+        Err(error) => {
+            error!("Unable to query server for name {}: {}", hostname, error);
+            return None;
+        }
+    };
 
-    let name_exists = match response.response_code() {
-        hickory_proto::op::ResponseCode::NXDomain => false,
-        hickory_proto::op::ResponseCode::NoError => true,
+    debug!(response = ?response, ns_response= ?ns_response, "Queried server for {}", hostname);
+
+    match response.response_code() {
+        hickory_proto::op::ResponseCode::NXDomain => (),
+        hickory_proto::op::ResponseCode::NoError => (),
         other => {
             error!("Server returned error: {}", other);
             return None;
@@ -123,7 +147,23 @@ async fn find_zone_root(hostname: &str, server: SocketAddr) -> Option<(Name, boo
         return None;
     }
 
-    match response.name_servers() {
+    for resp in response.answers() {
+        if resp.record_type().is_rrsig() {
+            continue;
+        }
+        if new_type.is_none() || resp.record_type() == new_type.unwrap().into() {
+            name_exists = true
+        }
+        info!(
+            "Found: {} {} {} {}",
+            resp.name().to_string().trim_end_matches("."),
+            resp.ttl(),
+            resp.record_type(),
+            resp.data()
+        );
+    }
+
+    match ns_response.name_servers() {
         [] => {
             error!("Server returned no name servers");
             None
@@ -174,9 +214,20 @@ async fn main() -> proc_exit::Exit {
            key.algorithm = %config.key.algorithm,
            "Init OK");
 
-    let Some((_root_zone, _name_exists)) = find_zone_root(&args.hostname, server_addr).await else {
+    if !args.delete && (args.record_type.is_none() || args.value.is_none()) {
+        error!("Must supply both record type and value when not deleting");
+        return Code::FAILURE.as_exit();
+    }
+    let Some((_root_zone, name_exists)) =
+        find_zone_root(&args.hostname, args.record_type, server_addr).await
+    else {
         return Code::FAILURE.as_exit();
     };
+
+    if !name_exists && args.delete {
+        error!("Can't delete name {} that doesn't exist", args.hostname);
+        return Code::FAILURE.as_exit();
+    }
 
     Code::SUCCESS.as_exit()
 }
