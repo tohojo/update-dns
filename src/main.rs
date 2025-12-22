@@ -374,9 +374,27 @@ async fn main() -> proc_exit::Exit {
            key.algorithm = %config.key.algorithm,
            "Init OK");
 
-    if !args.delete && (args.record_type.is_none() || args.value.len() == 0) {
-        error!("Must supply both record type and value when not deleting");
-        return Code::FAILURE.as_exit();
+    if args.delete {
+        if args.reverse {
+            error!("Can't use --delete and --reverse together");
+            return Code::FAILURE.as_exit();
+        }
+        if args.append {
+            error!("Can't use --delete and --append together");
+            return Code::FAILURE.as_exit();
+        }
+    } else {
+        if args.record_type.is_none() || args.value.len() == 0 {
+            error!("Must supply both record type and value when not deleting");
+            return Code::FAILURE.as_exit();
+        }
+        if args.reverse
+            && args.record_type != Some(DnsRecordType::A)
+            && args.record_type != Some(DnsRecordType::AAAA)
+        {
+            error!("Can only use --reverse with A and AAAA records");
+            return Code::FAILURE.as_exit();
+        }
     }
 
     let mut client = match create_client(server_addr, config.key).await {
