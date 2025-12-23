@@ -100,19 +100,17 @@ impl Args {
                     .ok_or(format_err!("No value"))?
                     .parse::<Name>()?,
             )),
-            Some(MX) => RData::MX(rdata::MX::new(
-                self.value
-                    .get(0)
-                    .ok_or(format_err!("No value"))?
-                    .parse::<u16>()
-                    .with_context(|| {
-                        format!("Invalid MX priority '{}'", self.value.get(0).unwrap())
-                    })?,
-                self.value
-                    .get(1)
-                    .ok_or(format_err!("Missing MX target"))?
-                    .parse::<Name>()?,
-            )),
+            Some(MX) => {
+                let (prio, name) = match self.value.as_slice() {
+                    [prio, name] => (
+                        prio.parse::<u16>()
+                            .with_context(|| format!("Invalid MX priority '{}'", prio))?,
+                        name.parse::<Name>()?,
+                    ),
+                    _ => bail!("Need two MX data fields (prio and name)"),
+                };
+                RData::MX(rdata::MX::new(prio, name))
+            }
             Some(NS) => RData::NS(rdata::NS(
                 self.value
                     .first()
@@ -125,33 +123,22 @@ impl Args {
                     .ok_or(format_err!("No value"))?
                     .parse::<Name>()?,
             )),
-            Some(SRV) => RData::SRV(rdata::SRV::new(
-                self.value
-                    .get(0)
-                    .ok_or(format_err!("No value"))?
-                    .parse::<u16>()
-                    .with_context(|| {
-                        format!("Invalid SRV priority '{}'", self.value.get(0).unwrap())
-                    })?,
-                self.value
-                    .get(1)
-                    .ok_or(format_err!("Missing SRV weight"))?
-                    .parse::<u16>()
-                    .with_context(|| {
-                        format!("Invalid SRV weight '{}'", self.value.get(1).unwrap())
-                    })?,
-                self.value
-                    .get(2)
-                    .ok_or(format_err!("Missing SRV port"))?
-                    .parse::<u16>()
-                    .with_context(|| {
-                        format!("Invalid SRV port '{}'", self.value.get(2).unwrap())
-                    })?,
-                self.value
-                    .get(3)
-                    .ok_or(format_err!("Missing SRV target"))?
-                    .parse::<Name>()?,
-            )),
+            Some(SRV) => {
+                let (prio, weight, port, name) = match self.value.as_slice() {
+                    [prio, weight, port, name] => (
+                        prio.parse::<u16>()
+                            .with_context(|| format!("Invalid SRV priority '{}'", prio))?,
+                        weight
+                            .parse::<u16>()
+                            .with_context(|| format!("Invalid SRV weight '{}'", weight))?,
+                        port.parse::<u16>()
+                            .with_context(|| format!("Invalid SRV port '{}'", port))?,
+                        name.parse::<Name>()?,
+                    ),
+                    _ => bail!("Need four SRV data fields (prio, weight, port and name)"),
+                };
+                RData::SRV(rdata::SRV::new(prio, weight, port, name))
+            }
             Some(TXT) => RData::TXT(rdata::TXT::new(self.value.clone())),
             None => bail!("No record type"),
         };
@@ -252,8 +239,8 @@ async fn delete_name(args: &Args, client: &mut Client) -> Result<()> {
                 continue;
             }
             let name: Name = match resp.data() {
-                RData::A(rdata::A(v)) => (*v).into(),
-                RData::AAAA(rdata::AAAA(v)) => (*v).into(),
+                &RData::A(rdata::A(v)) => v.into(),
+                &RData::AAAA(rdata::AAAA(v)) => v.into(),
                 _ => continue,
             };
             let (zone, rev_resp) = match find_zone_root(&name, Some(RecordType::PTR), client).await
