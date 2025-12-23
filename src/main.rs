@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// A DNS record type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -205,36 +205,77 @@ struct TsigKey {
     data: Vec<u8>,
 }
 
+async fn delete_record(record: Record, zone: Name, client: &mut Client) -> Result<()> {
+    info!(
+        "Deleting record type {} for name {}",
+        record.record_type(),
+        record.name(),
+    );
+
+    let response = client.delete_rrset(record, zone).await?;
+    debug!(response = ?response, "Received response for delete");
+    if response.response_code() != ResponseCode::NoError {
+        bail!("Server returned error: {}", response.response_code());
+    }
+    Ok(())
+}
+
 /// Delete a name from DNS.
 ///
 /// If a record type is set, delete only that type, otherwise delete all records
 /// for the name given in args.
 async fn delete_name(args: &Args, client: &mut Client) -> Result<()> {
-    let (zone, name_exists) =
+    let (zone, responses) =
         find_zone_root(&args.hostname, args.record_type.map(|r| r.into()), client).await?;
 
-    if !name_exists {
+    if responses.len() == 0 {
         bail!("Can't delete name {} that doesn't exist", args.hostname);
     }
 
-    let response = if let Some(record) = args.to_update0() {
-        info!(
-            "Deleting record type {} for name {}",
-            record.record_type(),
-            args.hostname
-        );
-        client.delete_rrset(record, zone.clone()).await?
+    if let Some(record) = args.to_update0() {
+        delete_record(record, zone, client).await?;
     } else {
         info!("Deleting all RRSETs for name {}", args.hostname);
-        client
-            .delete_all(args.hostname.clone(), zone.clone(), DNSClass::IN)
-            .await?
+        let response = client
+            .delete_all(args.hostname.clone(), zone, DNSClass::IN)
+            .await?;
+
+        debug!(response = ?response, "Received response for delete");
+        if response.response_code() != ResponseCode::NoError {
+            bail!("Server returned error: {}", response.response_code());
+        }
     };
 
-    debug!(response = ?response, "Received response for delete");
-    if response.response_code() != ResponseCode::NoError {
-        bail!("Server returned error: {}", response.response_code());
+    if args.reverse {
+        info!("Deleting reverse mappings for removed names");
+        for resp in responses {
+            if resp.record_type() != RecordType::A && resp.record_type() != RecordType::AAAA {
+                continue;
+            }
+            let name: Name = match resp.data() {
+                RData::A(rdata::A(v)) => (*v).into(),
+                RData::AAAA(rdata::AAAA(v)) => (*v).into(),
+                _ => continue,
+            };
+            let (zone, rev_resp) = match find_zone_root(&name, Some(RecordType::PTR), client).await
+            {
+                Ok(r) => r,
+                Err(error) => {
+                    warn!("Error deleting reverse name {}: {}", name, error);
+                    continue;
+                }
+            };
+            if rev_resp.len() == 0 {
+                continue;
+            }
+            let record = Record::update0(name, resp.ttl(), RecordType::PTR);
+            match delete_record(record, zone, client).await {
+                Ok(_) => (),
+                Err(error) => warn!("Error deleting reverse name: {}", error),
+            };
+        }
     }
+
     Ok(())
 }
 
@@ -249,13 +290,13 @@ async fn update_name(args: &Args, reverse: bool, client: &mut Client) -> Result<
         false => args.to_record()?,
     };
 
-    let (zone, name_exists) =
+    let (zone, responses) =
         find_zone_root(&record.name(), Some(record.record_type()), client).await?;
 
-    if name_exists {
+    if responses.len() > 0 {
         if args.append {
             info!("Appending record {}", record);
-            let response = client.append(record, zone.clone(), true).await?;
+            let response = client.append(record, zone, true).await?;
 
             debug!(response = ?response, "Received response for append");
             if response.response_code() != ResponseCode::NoError {
@@ -281,7 +322,7 @@ async fn update_name(args: &Args, reverse: bool, client: &mut Client) -> Result<
     }
 
     info!("Creating record {}", record);
-    let response = client.create(record, zone.clone()).await?;
+    let response = client.create(record, zone).await?;
 
     debug!(response = ?response, "Received response for create");
     if response.response_code() != ResponseCode::NoError {
@@ -326,12 +367,10 @@ async fn find_zone_root(
     hostname: &Name,
     new_type: Option<RecordType>,
     client: &mut Client,
-) -> Result<(Name, bool)> {
+) -> Result<(Name, Vec<Record>)> {
     debug!("Finding zone root for {}", hostname);
 
-    let mut name_exists = false;
-
-    let response = client
+    let mut response = client
         .query(hostname.clone(), DNSClass::IN, RecordType::ANY)
         .await?;
     let ns_response = client
@@ -360,9 +399,6 @@ async fn find_zone_root(
         if resp.record_type().is_rrsig() {
             continue;
         }
-        if new_type.is_none() || resp.record_type() == new_type.unwrap() {
-            name_exists = true
-        }
         info!(
             "Found: {} {} {} {}",
             resp.name().to_string().trim_end_matches("."),
@@ -372,11 +408,18 @@ async fn find_zone_root(
         );
     }
 
+    let responses = response
+        .answers_mut()
+        .extract_if(.., |r| {
+            new_type.is_none() || r.record_type() == new_type.unwrap()
+        })
+        .collect::<Vec<Record>>();
+
     match ns_response.name_servers() {
         [] => Err(format_err!("Server returned no name servers")),
         [first, ..] => {
             debug!("Found name server: {:?}", first);
-            Ok((first.name().clone(), name_exists))
+            Ok((first.name().clone(), responses))
         }
     }
 }
@@ -421,10 +464,6 @@ async fn main() -> proc_exit::Exit {
            "Init OK");
 
     if args.delete {
-        if args.reverse {
-            error!("Can't use --delete and --reverse together");
-            return Code::FAILURE.as_exit();
-        }
         if args.append {
             error!("Can't use --delete and --append together");
             return Code::FAILURE.as_exit();
@@ -434,13 +473,14 @@ async fn main() -> proc_exit::Exit {
             error!("Must supply both record type and value when not deleting");
             return Code::FAILURE.as_exit();
         }
-        if args.reverse
-            && args.record_type != Some(DnsRecordType::A)
-            && args.record_type != Some(DnsRecordType::AAAA)
-        {
-            error!("Can only use --reverse with A and AAAA records");
-            return Code::FAILURE.as_exit();
-        }
+    }
+    if args.reverse
+        && args.record_type != Some(DnsRecordType::A)
+        && args.record_type != Some(DnsRecordType::AAAA)
+        && !args.record_type.is_none()
+    {
+        error!("Can only use --reverse with A and AAAA records");
+        return Code::FAILURE.as_exit();
     }
 
     let mut client = match create_client(server_addr, config.key).await {
