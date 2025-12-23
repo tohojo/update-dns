@@ -7,7 +7,6 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, Name, Record, RecordType, rdata, record_data::RData};
 use hickory_proto::runtime::TokioRuntimeProvider;
 use hickory_proto::tcp::TcpClientStream;
-use proc_exit::Code;
 use serde::{Deserialize, Serialize};
 use serde_with::{base64::Base64, serde_as};
 use std::{
@@ -16,7 +15,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// A DNS record type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -425,7 +424,7 @@ async fn find_zone_root(
 }
 
 #[tokio::main]
-async fn main() -> proc_exit::Exit {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
@@ -433,29 +432,16 @@ async fn main() -> proc_exit::Exit {
     config_file.push("update-dns");
     config_file.push("config.yml");
 
-    let fd = match File::open(config_file) {
-        Ok(file) => file,
-        Err(error) => {
-            error!("Unable to open config file: {}", error);
-            return Code::FAILURE.as_exit();
-        }
-    };
+    let fd = File::open(config_file).context("Unable to open configuration file")?;
 
-    let config: Config = match serde_yaml::from_reader(fd) {
-        Ok(cfg) => cfg,
-        Err(error) => {
-            error!("Unable to parse configuration file: {}", error);
-            return Code::FAILURE.as_exit();
-        }
-    };
+    let config: Config =
+        serde_yaml::from_reader(fd).context("Unable to parse configuration file")?;
 
-    let server_addr = match format!("{}:53", config.server).to_socket_addrs() {
-        Ok(mut addrs) => addrs.nth(0).unwrap(),
-        Err(error) => {
-            error!("Unable to resolve server address: {}", error);
-            return Code::FAILURE.as_exit();
-        }
-    };
+    let server_addr = format!("{}:53", config.server)
+        .to_socket_addrs()
+        .context("Unable to resolve server address")?
+        .nth(0)
+        .unwrap();
     debug!(args = ?args,
            server = config.server,
            server_addr = ?server_addr,
@@ -465,13 +451,11 @@ async fn main() -> proc_exit::Exit {
 
     if args.delete {
         if args.append {
-            error!("Can't use --delete and --append together");
-            return Code::FAILURE.as_exit();
+            bail!("Can't use --delete and --append together");
         }
     } else {
         if args.record_type.is_none() || args.value.len() == 0 {
-            error!("Must supply both record type and value when not deleting");
-            return Code::FAILURE.as_exit();
+            bail!("Must supply both record type and value when not deleting");
         }
     }
     if args.reverse
@@ -479,45 +463,28 @@ async fn main() -> proc_exit::Exit {
         && args.record_type != Some(DnsRecordType::AAAA)
         && !args.record_type.is_none()
     {
-        error!("Can only use --reverse with A and AAAA records");
-        return Code::FAILURE.as_exit();
+        bail!("Can only use --reverse with A and AAAA records");
     }
 
-    let mut client = match create_client(server_addr, config.key).await {
-        Ok(client) => client,
-        Err(error) => {
-            error!("Error creating DNS client: {}", error);
-            return Code::FAILURE.as_exit();
-        }
-    };
+    let mut client = create_client(server_addr, config.key)
+        .await
+        .context("Couldn't create DNS client")?;
 
     if args.delete {
-        match delete_name(&args, &mut client).await {
-            Ok(_) => Code::SUCCESS.as_exit(),
-            Err(error) => {
-                error!("Error deleting name: {}", error);
-                Code::FAILURE.as_exit()
-            }
-        }
+        delete_name(&args, &mut client)
+            .await
+            .context("Couldn't delete name")?;
     } else {
-        match update_name(&args, false, &mut client).await {
-            Ok(_) => (),
-            Err(error) => {
-                error!("Error updating name: {}", error);
-                return Code::FAILURE.as_exit();
-            }
-        };
+        update_name(&args, false, &mut client)
+            .await
+            .context("Couldn't update name")?;
 
         if args.reverse {
             info!("Generating reverse record");
-            match update_name(&args, true, &mut client).await {
-                Ok(_) => (),
-                Err(error) => {
-                    error!("Error updating name: {}", error);
-                    return Code::FAILURE.as_exit();
-                }
-            };
+            update_name(&args, true, &mut client)
+                .await
+                .context("Couldn't generate reverse record")?;
         }
-        Code::SUCCESS.as_exit()
     }
+    Ok(())
 }
