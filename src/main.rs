@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::{base64::Base64, serde_as};
 use std::{
     fs::File,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::Arc,
     time::Duration,
 };
@@ -159,6 +159,26 @@ impl Args {
         Ok(Record::from_rdata(self.hostname.clone(), self.ttl, rdata))
     }
 
+    /// Create a reverse (PTR) record for the given arguments.
+    ///
+    /// Only works for A and AAAA records, errors on other record types
+    fn to_reverse_record(&self) -> Result<Record> {
+        let value = self.value.first().ok_or(format_err!("Missing value"))?;
+
+        let ip: IpAddr = match self.record_type {
+            Some(DnsRecordType::A) => IpAddr::V4(value.parse::<Ipv4Addr>()?),
+            Some(DnsRecordType::AAAA) => IpAddr::V6(value.parse::<Ipv6Addr>()?),
+            Some(t) => bail!("No reverse for record type {:?}", t),
+            None => bail!("No record type"),
+        };
+
+        Ok(Record::from_rdata(
+            ip.into(),
+            self.ttl,
+            RData::PTR(rdata::PTR(self.hostname.clone())),
+        ))
+    }
+
     /// Create an Update0 Record from the hostname and record type specified by
     /// the args
     fn to_update0(&self) -> Option<Record> {
@@ -189,7 +209,14 @@ struct TsigKey {
 ///
 /// If a record type is set, delete only that type, otherwise delete all records
 /// for the name given in args.
-async fn delete_name(args: &Args, zone: &Name, client: &mut Client) -> anyhow::Result<()> {
+async fn delete_name(args: &Args, client: &mut Client) -> Result<()> {
+    let (zone, name_exists) =
+        find_zone_root(&args.hostname, args.record_type.map(|r| r.into()), client).await?;
+
+    if !name_exists {
+        bail!("Can't delete name {} that doesn't exist", args.hostname);
+    }
+
     let response = if let Some(record) = args.to_update0() {
         info!(
             "Deleting record type {} for name {}",
@@ -216,13 +243,14 @@ async fn delete_name(args: &Args, zone: &Name, client: &mut Client) -> anyhow::R
 /// If the append flag is specified in args, add the record to the existing
 /// RRset. Otherwise, issue a delete for the given record type first,
 /// effectively replacing the record. If no record exists, create a new one.
-async fn update_name(
-    args: &Args,
-    zone: &Name,
-    name_exists: bool,
-    client: &mut Client,
-) -> anyhow::Result<()> {
-    let record = args.to_record()?;
+async fn update_name(args: &Args, reverse: bool, client: &mut Client) -> Result<()> {
+    let record = match reverse {
+        true => args.to_reverse_record()?,
+        false => args.to_record()?,
+    };
+
+    let (zone, name_exists) =
+        find_zone_root(&record.name(), Some(record.record_type()), client).await?;
 
     if name_exists {
         if args.append {
@@ -236,11 +264,12 @@ async fn update_name(
 
             return Ok(());
         } else {
-            let update0 = args.to_update0().unwrap();
+            let update0 =
+                Record::update0(record.name().clone(), record.ttl(), record.record_type());
             info!(
                 "Deleting type {} for name {}",
                 update0.record_type(),
-                args.hostname
+                update0.name(),
             );
             let response = client.delete_rrset(update0, zone.clone()).await?;
 
@@ -265,7 +294,7 @@ async fn update_name(
 ///
 /// Attach a TSig signer object, and spawn the background task to handle
 /// communication
-async fn create_client(server: SocketAddr, tsig_key: TsigKey) -> anyhow::Result<Client> {
+async fn create_client(server: SocketAddr, tsig_key: TsigKey) -> Result<Client> {
     let (stream, sender) = TcpClientStream::new(
         server,
         None,
@@ -295,7 +324,7 @@ async fn create_client(server: SocketAddr, tsig_key: TsigKey) -> anyhow::Result<
 /// whether a record of the given new_type exists in DNS.
 async fn find_zone_root(
     hostname: &Name,
-    new_type: Option<DnsRecordType>,
+    new_type: Option<RecordType>,
     client: &mut Client,
 ) -> Result<(Name, bool)> {
     debug!("Finding zone root for {}", hostname);
@@ -331,7 +360,7 @@ async fn find_zone_root(
         if resp.record_type().is_rrsig() {
             continue;
         }
-        if new_type.is_none() || resp.record_type() == new_type.unwrap().into() {
+        if new_type.is_none() || resp.record_type() == new_type.unwrap() {
             name_exists = true
         }
         info!(
@@ -422,21 +451,8 @@ async fn main() -> proc_exit::Exit {
         }
     };
 
-    let (root_zone, name_exists) =
-        match find_zone_root(&args.hostname, args.record_type, &mut client).await {
-            Ok(ret) => ret,
-            Err(error) => {
-                error!("Error finding root zone: {}", error);
-                return Code::FAILURE.as_exit();
-            }
-        };
-
     if args.delete {
-        if !name_exists {
-            error!("Can't delete name {} that doesn't exist", args.hostname);
-            return Code::FAILURE.as_exit();
-        }
-        match delete_name(&args, &root_zone, &mut client).await {
+        match delete_name(&args, &mut client).await {
             Ok(_) => Code::SUCCESS.as_exit(),
             Err(error) => {
                 error!("Error deleting name: {}", error);
@@ -444,12 +460,24 @@ async fn main() -> proc_exit::Exit {
             }
         }
     } else {
-        match update_name(&args, &root_zone, name_exists, &mut client).await {
-            Ok(_) => Code::SUCCESS.as_exit(),
+        match update_name(&args, false, &mut client).await {
+            Ok(_) => (),
             Err(error) => {
                 error!("Error updating name: {}", error);
-                Code::FAILURE.as_exit()
+                return Code::FAILURE.as_exit();
             }
+        };
+
+        if args.reverse {
+            info!("Generating reverse record");
+            match update_name(&args, true, &mut client).await {
+                Ok(_) => (),
+                Err(error) => {
+                    error!("Error updating name: {}", error);
+                    return Code::FAILURE.as_exit();
+                }
+            };
         }
+        Code::SUCCESS.as_exit()
     }
 }
