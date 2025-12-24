@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::{base64::Base64, serde_as};
 use std::{
     fs::File,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::Arc,
     time::Duration,
 };
@@ -81,66 +81,40 @@ impl Args {
     /// line, parsing the values into the right types for the given record type
     fn to_record(&self) -> Result<Record> {
         use DnsRecordType::*;
-        let rdata: RData = match self.record_type {
-            Some(A) => RData::A(rdata::A(
-                self.value
-                    .first()
-                    .ok_or(format_err!("No value"))?
-                    .parse::<Ipv4Addr>()?,
-            )),
-            Some(AAAA) => RData::AAAA(rdata::AAAA(
-                self.value
-                    .first()
-                    .ok_or(format_err!("No value"))?
-                    .parse::<Ipv6Addr>()?,
-            )),
-            Some(CNAME) => RData::CNAME(rdata::CNAME(
-                self.value
-                    .first()
-                    .ok_or(format_err!("No value"))?
-                    .parse::<Name>()?,
-            )),
-            Some(MX) => {
-                let (prio, name) = match self.value.as_slice() {
-                    [prio, name] => (
-                        prio.parse::<u16>()
-                            .with_context(|| format!("Invalid MX priority '{}'", prio))?,
-                        name.parse::<Name>()?,
-                    ),
-                    _ => bail!("Need two MX data fields (prio and name)"),
+        let value = self.value.first().ok_or(format_err!("Missing value"))?;
+
+        let rdata: RData = match self.record_type.ok_or(format_err!("No record type"))? {
+            A => RData::A(rdata::A(value.parse()?)),
+            AAAA => RData::AAAA(rdata::AAAA(value.parse()?)),
+            CNAME => RData::CNAME(rdata::CNAME(value.parse()?)),
+            MX => {
+                let [prio, name] = self.value.as_slice() else {
+                    bail!("Need two MX data fields (prio and name)");
                 };
-                RData::MX(rdata::MX::new(prio, name))
+                RData::MX(rdata::MX::new(
+                    prio.parse()
+                        .with_context(|| format!("Invalid MX priority '{}'", prio))?,
+                    name.parse()?,
+                ))
             }
-            Some(NS) => RData::NS(rdata::NS(
-                self.value
-                    .first()
-                    .ok_or(format_err!("No value"))?
-                    .parse::<Name>()?,
-            )),
-            Some(PTR) => RData::PTR(rdata::PTR(
-                self.value
-                    .first()
-                    .ok_or(format_err!("No value"))?
-                    .parse::<Name>()?,
-            )),
-            Some(SRV) => {
-                let (prio, weight, port, name) = match self.value.as_slice() {
-                    [prio, weight, port, name] => (
-                        prio.parse::<u16>()
-                            .with_context(|| format!("Invalid SRV priority '{}'", prio))?,
-                        weight
-                            .parse::<u16>()
-                            .with_context(|| format!("Invalid SRV weight '{}'", weight))?,
-                        port.parse::<u16>()
-                            .with_context(|| format!("Invalid SRV port '{}'", port))?,
-                        name.parse::<Name>()?,
-                    ),
-                    _ => bail!("Need four SRV data fields (prio, weight, port and name)"),
+            NS => RData::NS(rdata::NS(value.parse()?)),
+            PTR => RData::PTR(rdata::PTR(value.parse()?)),
+            SRV => {
+                let [prio, weight, port, name] = self.value.as_slice() else {
+                    bail!("Need four SRV data fields (prio, weight, port and name)");
                 };
-                RData::SRV(rdata::SRV::new(prio, weight, port, name))
+                RData::SRV(rdata::SRV::new(
+                    prio.parse()
+                        .with_context(|| format!("Invalid SRV priority '{}'", prio))?,
+                    weight
+                        .parse()
+                        .with_context(|| format!("Invalid SRV weight '{}'", weight))?,
+                    port.parse()
+                        .with_context(|| format!("Invalid SRV port '{}'", port))?,
+                    name.parse()?,
+                ))
             }
-            Some(TXT) => RData::TXT(rdata::TXT::new(self.value.clone())),
-            None => bail!("No record type"),
+            TXT => RData::TXT(rdata::TXT::new(self.value.clone())),
         };
         Ok(Record::from_rdata(self.hostname.clone(), self.ttl, rdata))
     }
@@ -149,13 +123,13 @@ impl Args {
     ///
     /// Only works for A and AAAA records, errors on other record types
     fn to_reverse_record(&self) -> Result<Record> {
+        use DnsRecordType::*;
         let value = self.value.first().ok_or(format_err!("Missing value"))?;
 
-        let ip: IpAddr = match self.record_type {
-            Some(DnsRecordType::A) => IpAddr::V4(value.parse::<Ipv4Addr>()?),
-            Some(DnsRecordType::AAAA) => IpAddr::V6(value.parse::<Ipv6Addr>()?),
-            Some(t) => bail!("No reverse for record type {:?}", t),
-            None => bail!("No record type"),
+        let ip: IpAddr = match self.record_type.ok_or(format_err!("No record type"))? {
+            A => IpAddr::V4(value.parse()?),
+            AAAA => IpAddr::V6(value.parse()?),
+            t => bail!("Can't reverse record type {:?}", t),
         };
 
         Ok(Record::from_rdata(
