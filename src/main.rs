@@ -389,7 +389,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let mut config_file = dirs::config_dir().unwrap();
+    let mut config_file = dirs::config_dir().ok_or(format_err!("Couldn't get config directory"))?;
     config_file.push("update-dns");
     config_file.push("config.yml");
 
@@ -402,7 +402,7 @@ async fn main() -> Result<()> {
         .to_socket_addrs()
         .context("Unable to resolve server address")?
         .nth(0)
-        .unwrap();
+        .ok_or(format_err!("No server address from resolver"))?;
     debug!(args = ?args,
            server = config.server,
            server_addr = ?server_addr,
