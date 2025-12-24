@@ -368,12 +368,12 @@ async fn find_zone_root(
         );
     }
 
-    let responses = response
+    let responses: Vec<Record> = response
         .answers_mut()
         .extract_if(.., |r| {
             new_type.is_none() || r.record_type() == new_type.unwrap()
         })
-        .collect::<Vec<Record>>();
+        .collect();
 
     match ns_response.name_servers() {
         [] => Err(format_err!("Server returned no name servers")),
