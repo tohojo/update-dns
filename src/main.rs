@@ -379,12 +379,12 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     if !args.delete && (args.record_type.is_none() || args.value.len() == 0) {
-        let mut cmd = Args::command();
-        cmd.error(
-            ErrorKind::ArgumentConflict,
-            "Must supply both record type and value when not deleting",
-        )
-        .exit();
+        Args::command()
+            .error(
+                ErrorKind::ArgumentConflict,
+                "Must supply both record type and value when not deleting",
+            )
+            .exit();
     }
     if args.reverse {
         use DnsRecordType::*;
@@ -393,12 +393,12 @@ async fn main() -> Result<()> {
             Some(AAAA) => (),
             None => (), // for delete all
             _ => {
-                let mut cmd = Args::command();
-                cmd.error(
-                    ErrorKind::ArgumentConflict,
-                    "Can only use --reverse with A and AAAA records",
-                )
-                .exit();
+                Args::command()
+                    .error(
+                        ErrorKind::ArgumentConflict,
+                        "Can only use --reverse with A and AAAA records",
+                    )
+                    .exit();
             }
         };
     }
