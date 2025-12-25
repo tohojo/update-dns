@@ -386,17 +386,21 @@ async fn main() -> Result<()> {
         )
         .exit();
     }
-    if args.reverse
-        && args.record_type != Some(DnsRecordType::A)
-        && args.record_type != Some(DnsRecordType::AAAA)
-        && !args.record_type.is_none()
-    {
-        let mut cmd = Args::command();
-        cmd.error(
-            ErrorKind::ArgumentConflict,
-            "Can only use --reverse with A and AAAA records",
-        )
-        .exit();
+    if args.reverse {
+        use DnsRecordType::*;
+        match args.record_type {
+            Some(A) => (),
+            Some(AAAA) => (),
+            None => (), // for delete all
+            _ => {
+                let mut cmd = Args::command();
+                cmd.error(
+                    ErrorKind::ArgumentConflict,
+                    "Can only use --reverse with A and AAAA records",
+                )
+                .exit();
+            }
+        };
     }
 
     let mut config_file = dirs::config_dir().ok_or(format_err!("Couldn't get config directory"))?;
