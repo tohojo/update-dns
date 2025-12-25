@@ -209,9 +209,6 @@ async fn delete_name(args: &Args, client: &mut Client) -> Result<()> {
     if args.reverse {
         info!("Deleting reverse mappings for removed names");
         for resp in responses {
-            if resp.record_type() != RecordType::A && resp.record_type() != RecordType::AAAA {
-                continue;
-            }
             let name: Name = match resp.data() {
                 &RData::A(rdata::A(v)) => v.into(),
                 &RData::AAAA(rdata::AAAA(v)) => v.into(),
