@@ -358,7 +358,8 @@ async fn find_zone_root(
     let responses: Vec<Record> = response
         .answers_mut()
         .extract_if(.., |r| {
-            new_type.is_none() || r.record_type() == new_type.unwrap()
+            !r.record_type().is_rrsig()
+                && (new_type.is_none() || r.record_type() == new_type.unwrap())
         })
         .collect();
 
