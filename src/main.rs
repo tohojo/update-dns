@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use anyhow::{Context, Result, bail, format_err};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, ValueEnum};

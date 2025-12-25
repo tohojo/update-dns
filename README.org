@@ -1,0 +1,77 @@
+* Simple RFC 2136 DNS updater tool
+
+This is a simple utility for updating a DNS zone using RFC 2136 (DNS UPDATE)
+queries to a compatible name server. It uses TSIG signing to authenticate the
+updates, with a key configured in =~/.config/dns-update/config.yml=, like:
+
+#+begin_src yaml
+server: ns.example.org
+key:
+  name: key.example.org.
+  algorithm: hmac-sha256
+  data: [base64-encoded key bytes]
+#+end_src
+
+The name server must be configured to accept the key for the zone being updated.
+
+** Building
+Simply build using Cargo:
+
+#+begin_src sh
+cargo build --release
+#+end_src
+
+** Running
+To update the DNS server, simply run the =update-dns= command:
+
+#+begin_src
+  # Create A record
+  update-dns name.example.org A 128.0.2.1
+
+  # Create CNAME record with custom ttl
+  update-dns name.example.org CNAME other.example.org --ttl 300
+
+  # Create A record with automatic reverse zone creation
+  update-dns name.example.org A 128.0.2.1 --reverse
+
+  # Delete all A records
+  update-dns name.example.org A --delete
+
+  # Delete all record types for a name
+  update-dns name.example.org --delete
+#+end_src
+
+By default, =update-dns= uses /replace/ semantics, so if a record of the given
+type exists already, it will first issue a delete, then create the new record.
+To append instead, add the =--append= flag, or use =--delete= to delete the
+name. If a record type is specified for --delete, only that record type will be
+deleted, otherwise all record types for the given name will be deleted.
+
+The =--reverse= flag will automatically create a reverse =PTR= record for the
+name being issued in the =in-addr.arpa= or =ip6.arpa= zones (as appropriate).
+If used with =--delete=, reverse names for any A or AAAA records found during
+the delete operation will be removed as well.
+
+Before issuing the update(s), =update-dns= will first query the server for any
+records for the name being updated and print the results. In addition, an NS
+record query will be sent to discover the root zone name of the name being
+updated. If any of these queries fail, or if the server reply does not have the
+/authoritative/ bit set, the update will be refused.
+
+** Full options
+#+begin_src
+Usage: update-dns [OPTIONS] <HOSTNAME> [RECORD_TYPE] [VALUE]...
+
+Arguments:
+  <HOSTNAME>     DNS hostname to update
+  [RECORD_TYPE]  DNS record type [possible values: A, AAAA, CNAME, MX, NS, PTR, SRV, TXT]
+  [VALUE]...     DNS record value
+
+Options:
+  -r, --reverse        Also insert reverse PTR entry
+  -d, --delete         Delete DNS entry
+  -a, --append         Append DNS entry instead of replacing
+  -t, --ttl <SECONDS>  DNS TTL [default: 86400]
+  -h, --help           Print help
+  -V, --version        Print version
+#+end_src
