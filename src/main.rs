@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail, format_err};
-use clap::{Parser, ValueEnum};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, ValueEnum};
 use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::dnssec::rdata::tsig::TsigAlgorithm;
 use hickory_proto::dnssec::tsig::TSigner;
@@ -64,11 +65,11 @@ struct Args {
     reverse: bool,
 
     /// Delete DNS entry
-    #[arg(short, long)]
+    #[arg(short, long, group = "extra_action")]
     delete: bool,
 
     /// Append DNS entry instead of replacing
-    #[arg(short, long)]
+    #[arg(short, long, group = "extra_action")]
     append: bool,
 
     /// DNS TTL
@@ -377,6 +378,27 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+    if !args.delete && (args.record_type.is_none() || args.value.len() == 0) {
+        let mut cmd = Args::command();
+        cmd.error(
+            ErrorKind::ArgumentConflict,
+            "Must supply both record type and value when not deleting",
+        )
+        .exit();
+    }
+    if args.reverse
+        && args.record_type != Some(DnsRecordType::A)
+        && args.record_type != Some(DnsRecordType::AAAA)
+        && !args.record_type.is_none()
+    {
+        let mut cmd = Args::command();
+        cmd.error(
+            ErrorKind::ArgumentConflict,
+            "Can only use --reverse with A and AAAA records",
+        )
+        .exit();
+    }
+
     let mut config_file = dirs::config_dir().ok_or(format_err!("Couldn't get config directory"))?;
     config_file.push("update-dns");
     config_file.push("config.yml");
@@ -397,23 +419,6 @@ async fn main() -> Result<()> {
            key.name = %config.key.name,
            key.algorithm = %config.key.algorithm,
            "Init OK");
-
-    if args.delete {
-        if args.append {
-            bail!("Can't use --delete and --append together");
-        }
-    } else {
-        if args.record_type.is_none() || args.value.len() == 0 {
-            bail!("Must supply both record type and value when not deleting");
-        }
-    }
-    if args.reverse
-        && args.record_type != Some(DnsRecordType::A)
-        && args.record_type != Some(DnsRecordType::AAAA)
-        && !args.record_type.is_none()
-    {
-        bail!("Can only use --reverse with A and AAAA records");
-    }
 
     let mut client = create_client(server_addr, config.key)
         .await
