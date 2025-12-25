@@ -75,3 +75,9 @@ Options:
   -h, --help           Print help
   -V, --version        Print version
 #+end_src
+
+** Go version
+This repository previously contained a Golang version of the same tool. I
+rewrote the tool as an exercise in learning Rust, and this version has more
+features and works better. The Go version is preserved in the =go-version=
+branch for the curious.
