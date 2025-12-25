@@ -166,6 +166,8 @@ struct TsigKey {
     data: Vec<u8>,
 }
 
+/// Delete a record from a zone
+/// Helper function to issue a delete of a record and check the response code
 async fn delete_record(record: Record, zone: Name, client: &mut Client) -> Result<()> {
     info!(
         "Deleting record type {} for name {}",
