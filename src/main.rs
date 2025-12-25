@@ -264,17 +264,7 @@ async fn update_name(args: &Args, reverse: bool, client: &mut Client) -> Result<
         } else {
             let update0 =
                 Record::update0(record.name().clone(), record.ttl(), record.record_type());
-            info!(
-                "Deleting type {} for name {}",
-                update0.record_type(),
-                update0.name(),
-            );
-            let response = client.delete_rrset(update0, zone.clone()).await?;
-
-            debug!(response = ?response, "Received response for delete");
-            if response.response_code() != ResponseCode::NoError {
-                bail!("Server returned error: {}", response.response_code());
-            }
+            delete_record(update0, zone.clone(), client).await?;
         }
     }
 
