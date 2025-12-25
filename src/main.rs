@@ -403,10 +403,10 @@ async fn main() -> Result<()> {
     config_file.push("update-dns");
     config_file.push("config.yml");
 
-    let fd = File::open(config_file).context("Unable to open configuration file")?;
-
-    let config: Config =
-        serde_yaml::from_reader(fd).context("Unable to parse configuration file")?;
+    let config: Config = serde_yaml::from_reader(
+        File::open(config_file).context("Unable to open configuration file")?,
+    )
+    .context("Unable to parse configuration file")?;
 
     let server_addr = format!("{}:53", config.server)
         .to_socket_addrs()
