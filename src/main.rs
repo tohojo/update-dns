@@ -380,7 +380,15 @@ async fn find_zone_root(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let subscriber = tracing_subscriber::fmt()
+        .event_format(
+            tracing_subscriber::fmt::format()
+                .with_target(false)
+                .without_time()
+                .compact(),
+        )
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
 
     let args = Args::parse();
     if !args.delete && (args.record_type.is_none() || args.value.is_empty()) {
