@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 /// A DNS record type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 #[value(rename_all = "UPPER")]
+#[allow(clippy::upper_case_acronyms)]
 enum DnsRecordType {
     A,
     AAAA,
@@ -33,6 +34,7 @@ enum DnsRecordType {
     TXT,
 }
 
+#[allow(clippy::from_over_into)]
 impl Into<RecordType> for DnsRecordType {
     fn into(self) -> RecordType {
         use DnsRecordType::*;
@@ -147,7 +149,7 @@ impl Args {
         Some(Record::update0(
             self.hostname.clone(),
             self.ttl,
-            self.record_type?.clone().into(),
+            self.record_type?.into(),
         ))
     }
 }
@@ -192,7 +194,7 @@ async fn delete_name(args: &Args, client: &mut Client) -> Result<()> {
     let (zone, responses) =
         find_zone_root(&args.hostname, args.record_type.map(|r| r.into()), client).await?;
 
-    if responses.len() == 0 {
+    if responses.is_empty() {
         bail!("Can't delete name {} that doesn't exist", args.hostname);
     }
 
@@ -213,9 +215,9 @@ async fn delete_name(args: &Args, client: &mut Client) -> Result<()> {
     if args.reverse {
         info!("Deleting reverse mappings for removed names");
         for resp in responses {
-            let name: Name = match resp.data() {
-                &RData::A(rdata::A(v)) => v.into(),
-                &RData::AAAA(rdata::AAAA(v)) => v.into(),
+            let name: Name = match *resp.data() {
+                RData::A(rdata::A(v)) => v.into(),
+                RData::AAAA(rdata::AAAA(v)) => v.into(),
                 _ => continue,
             };
             let (zone, rev_resp) = match find_zone_root(&name, Some(RecordType::PTR), client).await
@@ -226,7 +228,7 @@ async fn delete_name(args: &Args, client: &mut Client) -> Result<()> {
                     continue;
                 }
             };
-            if rev_resp.len() == 0 {
+            if rev_resp.is_empty() {
                 continue;
             }
             let record = Record::update0(name, resp.ttl(), RecordType::PTR);
@@ -252,9 +254,9 @@ async fn update_name(args: &Args, reverse: bool, client: &mut Client) -> Result<
     };
 
     let (zone, responses) =
-        find_zone_root(&record.name(), Some(record.record_type()), client).await?;
+        find_zone_root(record.name(), Some(record.record_type()), client).await?;
 
-    if responses.len() > 0 {
+    if !responses.is_empty() {
         if args.append {
             info!("Appending record {}", record);
             let response = client.append(record, zone, true).await?;
@@ -381,7 +383,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    if !args.delete && (args.record_type.is_none() || args.value.len() == 0) {
+    if !args.delete && (args.record_type.is_none() || args.value.is_empty()) {
         Args::command()
             .error(
                 ErrorKind::ArgumentConflict,
@@ -418,7 +420,7 @@ async fn main() -> Result<()> {
     let server_addr = format!("{}:53", config.server)
         .to_socket_addrs()
         .context("Unable to resolve server address")?
-        .nth(0)
+        .next()
         .ok_or(format_err!("No server address from resolver"))?;
     debug!(args = ?args,
            server = config.server,
