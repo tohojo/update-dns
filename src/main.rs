@@ -18,6 +18,7 @@ use std::{
     time::Duration,
 };
 use tracing::{Level, debug, info, trace, warn};
+use tracing_subscriber::prelude::*;
 
 /// A DNS record type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -391,23 +392,36 @@ async fn find_zone_root(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-
-    let level = match args.verbose {
+fn setup_logging(verbose: u8) {
+    let log_level = match verbose {
         0 => Level::INFO,
         1 => Level::DEBUG,
         _ => Level::TRACE,
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(false)
-        .without_time()
-        .compact()
-        .init();
+    let hickory_level = match verbose {
+        0..3 => Level::INFO,
+        _ => Level::TRACE,
+    };
 
+    let format = tracing_subscriber::fmt::format()
+        .with_target(hickory_level > Level::INFO)
+        .without_time()
+        .compact();
+
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_default(log_level)
+        .with_target("hickory_proto", hickory_level);
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().event_format(format))
+        .with(filter)
+        .init();
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
     if !args.delete && (args.record_type.is_none() || args.value.is_empty()) {
         Args::command()
             .error(
@@ -447,6 +461,8 @@ async fn main() -> Result<()> {
         .context("Unable to resolve server address")?
         .next()
         .ok_or(format_err!("No server address from resolver"))?;
+
+    setup_logging(args.verbose);
     trace!(args = ?args,
            server = config.server,
            server_addr = ?server_addr,
