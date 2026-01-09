@@ -56,6 +56,7 @@ impl Into<RecordType> for DnsRecordType {
 #[command(version, about, long_about = None)]
 struct Args {
     /// DNS hostname to update
+    #[arg(value_parser = parse_hostname)]
     hostname: Name,
 
     /// DNS record type
@@ -83,6 +84,14 @@ struct Args {
     /// DNS TTL
     #[arg(short, long, value_name = "SECONDS", default_value_t = 86400)]
     ttl: u32,
+}
+
+fn parse_hostname(s: &str) -> Result<Name> {
+    let n: Name = match s.parse::<IpAddr>() {
+        Ok(i) => i.into(),
+        Err(_) => s.parse()?,
+    };
+    Ok(n)
 }
 
 impl Args {
