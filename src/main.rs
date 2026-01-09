@@ -17,8 +17,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tracing::{debug, info, trace, warn};
-use tracing_subscriber::{EnvFilter, prelude::*};
+use tracing::{Level, debug, info, trace, warn};
 
 /// A DNS record type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -397,21 +396,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let level = match args.verbose {
-        0 => "INFO",
-        1 => "DEBUG",
-        _ => "TRACE",
+        0 => Level::INFO,
+        1 => Level::DEBUG,
+        _ => Level::TRACE,
     };
 
-    let format = tracing_subscriber::fmt::format()
+    tracing_subscriber::fmt()
+        .with_max_level(level)
         .with_target(false)
         .without_time()
-        .compact();
-
-    let layer = tracing_subscriber::fmt::layer().event_format(format);
-
-    tracing_subscriber::registry()
-        .with(layer)
-        .with(EnvFilter::new(level))
+        .compact()
         .init();
 
     if !args.delete && (args.record_type.is_none() || args.value.is_empty()) {
