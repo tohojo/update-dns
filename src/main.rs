@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use anyhow::{Context, Result, bail, format_err};
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::dnssec::rdata::tsig::TsigAlgorithm;
 use hickory_proto::dnssec::tsig::TSigner;
@@ -17,7 +17,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
+use tracing_subscriber::{EnvFilter, prelude::*};
 
 /// A DNS record type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -74,6 +75,10 @@ struct Args {
     /// Append DNS entry instead of replacing
     #[arg(short, long, group = "extra_action")]
     append: bool,
+
+    /// Increase log verbosity (supply multiple times for more verbosity)
+    #[arg(short, long, action=ArgAction::Count, default_value_t = 0)]
+    verbose: u8,
 
     /// DNS TTL
     #[arg(short, long, value_name = "SECONDS", default_value_t = 86400)]
@@ -179,7 +184,7 @@ async fn delete_record(record: Record, zone: Name, client: &mut Client) -> Resul
     );
 
     let response = client.delete_rrset(record, zone).await?;
-    debug!(response = ?response, "Received response for delete");
+    trace!(response = ?response, "Received response for delete");
     if response.response_code() != ResponseCode::NoError {
         bail!("Server returned error: {}", response.response_code());
     }
@@ -206,7 +211,7 @@ async fn delete_name(args: &Args, client: &mut Client) -> Result<()> {
             .delete_all(args.hostname.clone(), zone, DNSClass::IN)
             .await?;
 
-        debug!(response = ?response, "Received response for delete");
+        trace!(response = ?response, "Received response for delete");
         if response.response_code() != ResponseCode::NoError {
             bail!("Server returned error: {}", response.response_code());
         }
@@ -261,7 +266,7 @@ async fn update_name(args: &Args, reverse: bool, client: &mut Client) -> Result<
             info!("Appending record {}", record);
             let response = client.append(record, zone, true).await?;
 
-            debug!(response = ?response, "Received response for append");
+            trace!(response = ?response, "Received response for append");
             if response.response_code() != ResponseCode::NoError {
                 bail!("Server returned error: {}", response.response_code());
             }
@@ -277,7 +282,7 @@ async fn update_name(args: &Args, reverse: bool, client: &mut Client) -> Result<
     info!("Creating record {}", record);
     let response = client.create(record, zone).await?;
 
-    debug!(response = ?response, "Received response for create");
+    trace!(response = ?response, "Received response for create");
     if response.response_code() != ResponseCode::NoError {
         bail!("Server returned error: {}", response.response_code());
     }
@@ -330,7 +335,7 @@ async fn find_zone_root(
         .query(hostname.clone(), DNSClass::IN, RecordType::NS)
         .await?;
 
-    debug!(response = ?response, ns_response= ?ns_response, "Queried server for {}", hostname);
+    trace!(response = ?response, ns_response= ?ns_response, "Queried server for {}", hostname);
 
     match response.response_code() {
         ResponseCode::NXDomain => (),
@@ -380,17 +385,26 @@ async fn find_zone_root(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let subscriber = tracing_subscriber::fmt()
-        .event_format(
-            tracing_subscriber::fmt::format()
-                .with_target(false)
-                .without_time()
-                .compact(),
-        )
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
     let args = Args::parse();
+
+    let level = match args.verbose {
+        0 => "INFO",
+        1 => "DEBUG",
+        _ => "TRACE",
+    };
+
+    let format = tracing_subscriber::fmt::format()
+        .with_target(false)
+        .without_time()
+        .compact();
+
+    let layer = tracing_subscriber::fmt::layer().event_format(format);
+
+    tracing_subscriber::registry()
+        .with(layer)
+        .with(EnvFilter::new(level))
+        .init();
+
     if !args.delete && (args.record_type.is_none() || args.value.is_empty()) {
         Args::command()
             .error(
@@ -430,7 +444,7 @@ async fn main() -> Result<()> {
         .context("Unable to resolve server address")?
         .next()
         .ok_or(format_err!("No server address from resolver"))?;
-    debug!(args = ?args,
+    trace!(args = ?args,
            server = config.server,
            server_addr = ?server_addr,
            key.name = %config.key.name,
