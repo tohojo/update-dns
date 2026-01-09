@@ -386,7 +386,7 @@ async fn find_zone_root(
     match ns_response.name_servers() {
         [] => Err(format_err!("Server returned no name servers")),
         [first, ..] => {
-            debug!("Found name server: {:?}", first);
+            debug!("Found NS record for zone {}", first.name());
             Ok((first.name().clone(), responses))
         }
     }
